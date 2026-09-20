@@ -582,11 +582,12 @@ def _chown_to_hermes_uid(path) -> None:
         pass
 
 
-def _secure_dir(path):
+def _secure_dir(path, *, preserve_readonly=False):
     """chmod a directory owner-only (0700) and apply HERMES_UID/GID ownership. No-op when managed;
     in a container only an explicit HERMES_HOME_MODE is applied. HERMES_HOME_MODE (e.g. 0701)
     overrides the mode so a web server can traverse HERMES_HOME to a served subdirectory without
-    directory listings.
+    directory listings. With ``preserve_readonly``, the default mode does not add
+    permissions to an existing directory with no write bits; explicit modes still win.
 
     Also applies ``HERMES_UID``/``HERMES_GID``-based ownership when those env vars are set (#34107 — Docker
     deployments need this so profile subdirs created at runtime by kanban workers don't land as root:root
@@ -606,6 +607,10 @@ def _secure_dir(path):
     except ValueError:
         mode = 0o700
     try:
+        if preserve_readonly and not explicit_mode:
+            current_mode = stat.S_IMODE(os.stat(path).st_mode)
+            if not current_mode & 0o222:
+                mode &= current_mode
         os.chmod(path, mode)
     except (OSError, NotImplementedError):
         pass
