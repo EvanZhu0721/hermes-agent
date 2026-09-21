@@ -1294,6 +1294,10 @@ export interface Translations {
       serverStopped: string
       serverStarted: string
       serverStopFailed: string
+      resetServer: string
+      resetServerDetail: string
+      serverReset: string
+      serverResetFailed: string
       serverStartFailed: string
       activating: string
       activateFailed: (model: string) => string
