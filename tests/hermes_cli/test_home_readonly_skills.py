@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+import hermes_constants
 from hermes_cli import config
 from hermes_cli.config_home import _ensure_directory, initialize_home
 
@@ -19,11 +20,11 @@ from hermes_cli.config_home import _ensure_directory, initialize_home
 def test_secure_dir_requested_mode(monkeypatch, existing_mode, explicit_mode, preserve, expected):
     """Check requested syscalls, without pretending Windows has POSIX permissions."""
     monkeypatch.setenv("HERMES_HOME_MODE", explicit_mode)
-    with patch.object(config, "is_managed", return_value=False), \
-         patch.object(config, "_is_container", return_value=False), \
-         patch.object(config, "_chown_to_hermes_uid") as chown, \
-         patch.object(config.os, "stat", return_value=SimpleNamespace(st_mode=existing_mode)), \
-         patch.object(config.os, "chmod") as chmod:
+    with patch.object(hermes_constants, "get_managed_system", return_value=None), \
+         patch.object(hermes_constants, "_container_or_chmod_skipped", return_value=False), \
+         patch.object(hermes_constants, "_chown_to_hermes_uid") as chown, \
+         patch.object(hermes_constants.os, "stat", return_value=SimpleNamespace(st_mode=existing_mode)), \
+         patch.object(hermes_constants.os, "chmod") as chmod:
         config._secure_dir("skills", preserve_readonly=preserve)
     chmod.assert_called_once_with("skills", expected)
     chown.assert_called_once_with("skills")
@@ -79,7 +80,7 @@ def test_load_config_real_directory_permissions(
         monkeypatch.delenv(variable, raising=False)
     # CI may itself run in a container; exercise the non-container policy while
     # retaining the host's real filesystem and permission syscalls.
-    monkeypatch.setattr(config, "_is_container", lambda: False)
+    monkeypatch.setattr(hermes_constants, "_container_or_chmod_skipped", lambda: False)
     assert str(home) not in config._HERMES_HOME_ENSURED
     try:
         config.load_config()
