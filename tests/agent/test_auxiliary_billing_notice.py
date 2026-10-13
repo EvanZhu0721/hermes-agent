@@ -27,23 +27,21 @@ class _Session(StatusOutputMixin):
 def wire(monkeypatch, tmp_path):
     """Real config, resolver, SDK and recovery ladder; only the HTTP transport is offline."""
     from agent import anthropic_adapter
-    from agent import command_token_source
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(anthropic_adapter, "_get_claude_code_version", lambda: "test")
     ac.clear_runtime_main()
     ac._reset_aux_unhealthy_cache()
     attempts = []
     state = SimpleNamespace(primary="sk-ant-oat01-test", fallback="sk-ant-api03-test", fail=False)
-    state.commands = False
-    monkeypatch.setattr(command_token_source, "_mint", lambda command, label: (
-        state.primary if command == "offline-subscription" else state.fallback, None))
     state.notices_at_paid = []
     def send(_client, request, **kwargs):
         key = request.headers.get("x-api-key") or request.headers.get("authorization", "").removeprefix("Bearer ")
         attempts.append(key)
         if key == state.fallback and hasattr(state, "session"):
             state.notices_at_paid.append(len(state.session.statuses))
-        if key == state.primary or state.fail:
+        primary_failed = key == state.primary and (
+            not getattr(state, "same_provider", False) or json.loads(request.content)["model"] == "claude-sonnet-4-5")
+        if primary_failed or state.fail:
             return httpx.Response(429, request=request, json={"type": "error", "error": {
                 "type": "rate_limit_error", "message": "Rate limit exceeded"}})
         message = {
@@ -75,12 +73,9 @@ def wire(monkeypatch, tmp_path):
                 name: {"base_url": "https://api.anthropic.com", "api_mode": "anthropic_messages", "api_key": key}
                 for name, key in (("subscription", state.primary), ("paid", state.fallback))
             },
-            "fallback_providers": [{"provider": "paid", "model": "claude-haiku-4-5"}],
+            "fallback_providers": [{"provider": "subscription" if getattr(state, "same_provider", False) else "paid",
+                                    "model": "claude-haiku-4-5"}],
         }
-        if state.commands:
-            for name, entry in config["providers"].items():
-                entry.pop("api_key")
-                entry["key_cmd"] = f"offline-{name}"
         (get_hermes_home() / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
     yield state, attempts, configure
     ac.clear_runtime_main()
@@ -121,17 +116,15 @@ def test_paid_fallback_is_visible_even_when_it_fails(wire, async_mode, fails):
     assert state.fallback in attempts
     assert len(session.statuses) == 1
     kind, message = session.statuses[0]
-    assert kind == "warn" and "pay-per-token" in message and "OAuth" in message
-    assert "paid" in message and "title_generation" in message
+    assert kind == "warn" and "additional charges" in message and "subscription" in message
+    assert "paid" in message
     assert state.primary not in message and state.fallback not in message
     assert session.printed == [message]
     assert state.notices_at_paid and all(count == 1 for count in state.notices_at_paid)
 
 
-@pytest.mark.parametrize("fallback_key,expected", [("sk-ant-oat01-other", 0), ("sk-ant-api03-test", 1)])
-def test_notice_is_scoped_to_the_live_session(wire, fallback_key, expected):
-    state, _attempts, configure = wire
-    state.fallback = fallback_key
+def test_notice_is_scoped_to_the_live_session(wire):
+    _state, _attempts, configure = wire
     configure()
     first, second = _Session("first"), _Session("second")
     from agent.turn_context import _publish_runtime_main
@@ -142,31 +135,38 @@ def test_notice_is_scoped_to_the_live_session(wire, fallback_key, expected):
     for owner in (first, first, second):
         ac._reset_aux_unhealthy_cache()
         assert contexts[owner].run(_invoke, owner, False, True).choices[0].message.content == "recovered"
-    assert len(first.statuses) == len(second.statuses) == expected
+    assert len(first.statuses) == len(second.statuses) == 1
     first.session_id = "new-session"
     ac._reset_aux_unhealthy_cache()
     _invoke(first, False)
-    assert len(first.statuses) == 2 * expected
+    assert len(first.statuses) == 2
 
 
-def test_billing_notice_does_not_reinvoke_token_sources(wire, monkeypatch):
-    state, _attempts, configure = wire
-    state.commands = True
+def test_same_provider_model_fallback_is_silent(wire):
+    state, attempts, configure = wire
+    state.same_provider = True
     configure()
-    named, model = ac.resolve_provider_client("subscription", "claude-sonnet-4-5")
-    # The anonymous custom route is the #136508 trigger: its outer adapter identity
-    # can be wrong even though the native SDK correctly sends OAuth on the wire.
-    primary, _ = ac.resolve_provider_client(
-        "custom", model, explicit_base_url="https://api.anthropic.com",
-        explicit_api_key=named.api_key, api_mode="anthropic_messages")
-    fallback, _ = ac.resolve_provider_client("paid", "claude-haiku-4-5")
-    calls, notices = [], []
-    def forbidden_mint(self):
-        calls.append(self)
-        raise AssertionError("A diagnostic must not ask for another token")
-    from agent.command_token_source import CommandTokenSource
-    monkeypatch.setattr(CommandTokenSource, "__call__", forbidden_mint)
-    ac.warn_paid_fallback(primary, fallback, task="compression", label="paid",
-                         runtime={"billing_warning_callback": notices.append})
-    assert calls == []
-    assert len(notices) == 1 and "pay-per-token" in notices[0]
+    session = _Session("same-provider")
+    assert _invoke(session, False).choices[0].message.content == "recovered"
+    assert attempts and set(attempts) == {state.primary}
+    assert session.statuses == []
+
+
+def test_custom_destinations_deduplicate_without_disclosing_urls(wire, caplog):
+    session = _Session("custom")
+    source, _ = ac.resolve_provider_client(
+        "custom", "test-model", explicit_base_url="https://source.internal/v1", explicit_api_key="offline-key")
+    runtime = {"billing_warning_callback": session._warn_auxiliary_billing}
+    caplog.set_level("INFO", logger="agent.auxiliary_billing")
+    for url in ("https://secret-user:secret-pass@one.internal/v1?key=secret-query",
+                "https://one.internal/v1?key=rotated-secret", "https://two.internal/v1"):
+        target, _ = ac.resolve_provider_client(
+            "custom", "test-model", explicit_base_url=url, explicit_api_key="offline-key")
+        ac.warn_service_fallback(source, target, source_provider="custom", target_provider="custom", runtime=runtime)
+    assert len(session.statuses) == 2
+    notices = " ".join(message for _, message in session.statuses)
+    route_logs = [r.message for r in caplog.records if r.name == "agent.auxiliary_billing"]
+    assert len(route_logs) == 3
+    for text in [notices, *route_logs]:
+        assert all(secret not in text for secret in ("secret", "internal", "offline-key"))
+    assert all("additional charges" in text for _, text in session.statuses)

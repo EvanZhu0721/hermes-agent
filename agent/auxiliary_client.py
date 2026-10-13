@@ -32,7 +32,7 @@ from agent.error_classifier import (
     is_reasoning_required_rejection,
 )
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
-from agent.auxiliary_billing import warn_paid_fallback
+from agent.auxiliary_billing import warn_service_fallback
 from agent.auxiliary_structured_output import remember_structured_output_rejection
 from agent.codex_headers import (
     CODEX_AUX_BASE_URL as _CODEX_AUX_BASE_URL,
@@ -2757,7 +2757,7 @@ def _runtime_main_value(field: str) -> Any:
 def set_runtime_main(
     provider: str, model: str, *, requested_provider: str = "", base_url: str = "",
     api_key: Any = "", api_mode: str = "", auth_mode: str = "", session_id: str = "",
-    cache_scope: str = "", billing_warning_callback: Optional[Callable[[str], None]] = None,
+    cache_scope: str = "", billing_warning_callback: Optional[Callable[..., None]] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -7628,6 +7628,7 @@ class _LadderRoute(NamedTuple):
     main_runtime: Optional[dict[str, Any]]
     route_info: Optional[dict[str, str]]
     timeout: Optional[float]
+    request_provider: str = ""
 
 
 def _without_temperature(kwargs: dict) -> Optional[dict]:
@@ -7937,7 +7938,9 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             break
         tried_lanes.add(lane)
         _record_route_info(route.route_info, _fallback_provider_from_label(fb_label), fb_model)
-        warn_paid_fallback(route.client, fb_client, task=task, label=fb_label, runtime=route.main_runtime)
+        warn_service_fallback(route.client, fb_client, runtime=route.main_runtime,
+                              source_provider=_fallback_provider_from_label(route.request_provider or resolved_provider),
+                              target_provider=_fallback_provider_from_label(fb_label))
         fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
         if fb_resp is not None:
             return fb_resp
@@ -7955,17 +7958,14 @@ def _aux_recovery_ladder(
     async_mode: bool, base_info: str, resolved_provider: str, resolved_model: Optional[str],
     resolved_base_url: Optional[str], resolved_api_key: Optional[str],
     resolved_api_mode: Optional[str], final_model: Optional[str], max_tokens: Optional[int],
-    main_runtime: Optional[dict[str, Any]], route_info: Optional[dict[str, str]],
+    main_runtime: Optional[dict[str, Any]], route_info: Optional[dict[str, str]], request_provider: str = "",
 ):
-    """Ordered recovery rungs after the primary request failed (generator): parameter
-    strips → Nous heal/refresh → credential refresh/pool rotation → provider fallback.
-    Each rung returns a response, narrows ``first_err`` and falls through, or re-raises.
-    Raises the narrowed ``first_err`` when exhausted (after evicting a connection-poisoned client)."""
+    """Recover parameter, Nous, credential and provider failures in order; re-raise when exhausted."""
     tag = " (async)" if async_mode else ""
     route = _LadderRoute(
         client, task, tag, async_mode, base_info, resolved_provider, resolved_model,
         resolved_base_url, resolved_api_key, resolved_api_mode, final_model, main_runtime, route_info,
-        kwargs.get("timeout"))
+        kwargs.get("timeout"), request_provider)
     resp, first_err, kwargs = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
     if first_err is None:
         return resp
@@ -8172,7 +8172,7 @@ def _start_recovery_ladder(
         resolved_model=req.resolved_model, resolved_base_url=req.resolved_base_url,
         resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
         final_model=req.final_model, max_tokens=retry_kwargs["max_tokens"],
-        main_runtime=retry_kwargs["main_runtime"], route_info=route_info)
+        main_runtime=retry_kwargs["main_runtime"], route_info=route_info, request_provider=req.request_provider)
 
 
 def _call_llm_impl(
