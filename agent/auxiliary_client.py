@@ -32,6 +32,7 @@ from agent.error_classifier import (
     is_reasoning_required_rejection,
 )
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
+from agent.auxiliary_billing import warn_paid_fallback
 from agent.auxiliary_structured_output import remember_structured_output_rejection
 from agent.codex_headers import (
     CODEX_AUX_BASE_URL as _CODEX_AUX_BASE_URL,
@@ -2756,7 +2757,7 @@ def _runtime_main_value(field: str) -> Any:
 def set_runtime_main(
     provider: str, model: str, *, requested_provider: str = "", base_url: str = "",
     api_key: Any = "", api_mode: str = "", auth_mode: str = "", session_id: str = "",
-    cache_scope: str = "",
+    cache_scope: str = "", billing_warning_callback: Optional[Callable[[str], None]] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -2767,6 +2768,7 @@ def set_runtime_main(
     ``cache_scope`` is the rotation-stable logical cache scope (compression- lineage root —
     agent/prompt_cache_scope.py) resolved once per turn by turn_context; auxiliary Responses calls prefer it
     over ``session_id`` for prompt_cache_key derivation (#79017).
+    ``billing_warning_callback`` belongs to this live session, never to the legacy mirrors.
     """
     runtime = {
         "provider": (provider or "").strip().lower(),
@@ -2778,6 +2780,7 @@ def set_runtime_main(
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
+        "billing_warning_callback": billing_warning_callback,
     }
     # Publish authoritative context before updating the locked mirrors.
     token = _RUNTIME_MAIN_CONTEXT.set(runtime)
@@ -3098,7 +3101,7 @@ def _try_anthropic(explicit_api_key: Optional[str | Callable[[], str]] = None,
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
 _MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
-    "requested_provider", "session_id", "cache_scope",
+    "requested_provider", "session_id", "cache_scope", "billing_warning_callback",
 )
 
 
@@ -3118,7 +3121,7 @@ def _normalize_main_runtime(main_runtime: Optional[dict[str, Any]]) -> dict[str,
     normalized: dict[str, Any] = {}
     for field in _MAIN_RUNTIME_CONTEXT_FIELDS:
         value = main_runtime.get(field)
-        if field == "api_key" and callable(value) and not isinstance(value, str):
+        if field in ("api_key", "billing_warning_callback") and callable(value):
             normalized[field] = value
         elif isinstance(value, str) and value.strip():
             normalized[field] = value.strip()
@@ -7934,17 +7937,14 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             break
         tried_lanes.add(lane)
         _record_route_info(route.route_info, _fallback_provider_from_label(fb_label), fb_model)
+        warn_paid_fallback(route.client, fb_client, task=task, label=fb_label, runtime=route.main_runtime)
         fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
         if fb_resp is not None:
             return fb_resp
         fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
             task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
             task_chain_only=explicit_auth_with_task_chain)
-    # All fallback layers exhausted — one user-visible warning, then re-raise.
     logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
-                   # All fallback layers exhausted — emit a single user-visible warning so the operator
-                   # knows aux task is about to fail. (#26882) The error itself is re-raised below.
-                   # (#26882)
                    "(fallback_chain + main agent model). Raising the primary error.",
                    task or "call", tag, reason, resolved_provider)
     return None
