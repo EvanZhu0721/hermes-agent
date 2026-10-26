@@ -56,22 +56,27 @@ describe('markdown prose renders tilde ranges and unknown tags literally', () =>
     expect(container.textContent).toContain('2<3')
   })
 
-  it('renders autolinks for urls (tilde-in-url is a streamdown remend quirk, asserted loosely)', () => {
-    const { container } = render(
-      <MarkdownTextContent isRunning={false} text={'Docs at https://example.com/a_b/c~d/page'} />
-    )
+  const url = 'https://example.com/~alice/report~draft'
 
-    const link = container.querySelector('a')
+  it.each([url, `<${url}>`, `[Report](${url})`])(
+    'preserves the full URL while streaming and after completion: %s',
+    text => {
+      const { container, rerender } = render(<MarkdownTextContent isRunning={true} text={text} />)
 
-    expect(link).not.toBeNull()
-    // Streamdown's tailBoundedRemend escapes `~` even inside autolinks
-    // (pre-existing library behaviour, unchanged by this fix) — assert the link
-    // itself mounted and points at the host, not byte-exact URL round-trip.
-    expect(link?.getAttribute('href')).toContain('example.com')
-  })
+      expect(container.querySelector('a')?.getAttribute('href')).toBe(url)
+
+      rerender(<MarkdownTextContent isRunning={false} text={text} />)
+
+      expect(container.querySelector('a')?.getAttribute('href')).toBe(url)
+    }
+  )
 
   it('still renders intentional ~~strikethrough~~', () => {
-    const { container } = render(<MarkdownTextContent isRunning={false} text={'保留 ~~deleted~~ 删除线。'} />)
+    const { container, rerender } = render(<MarkdownTextContent isRunning={true} text={'保留 ~~deleted'} />)
+
+    expect(container.querySelector('del, s')?.textContent).toBe('deleted')
+
+    rerender(<MarkdownTextContent isRunning={false} text={'保留 ~~deleted~~ 删除线。'} />)
 
     expect(container.querySelectorAll('del, s').length).toBeGreaterThan(0)
     expect(container.textContent).toContain('deleted')

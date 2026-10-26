@@ -119,7 +119,8 @@ const REMARK_PLUGINS = [...Object.values(defaultRemarkPlugins), remarkTranscript
 // identity is stable across renders.
 function preprocessWithTailRepair(text: string): string {
   try {
-    return tailBoundedRemend(preprocessMarkdown(text))
+    // Prose tildes are already escaped; remend's pass also escapes URL paths.
+    return tailBoundedRemend(preprocessMarkdown(text), { singleTilde: false })
   } catch {
     return text
   }
